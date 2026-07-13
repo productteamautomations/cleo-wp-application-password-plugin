@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: Application Passwords
- * Version: 1.0.0
+ * Version: 1.0.1
  * Update URI: https://github.com/
  */
 
@@ -65,35 +65,50 @@ function apw_save_tokens($user_id, $tokens) {
 $GLOBALS['apw_authed'] = false;
 
 add_filter('determine_current_user', function ($user_id) {
-    if (!empty($user_id) || !apw_is_secure_rest()) {
+    // Re-entrancy guard. Anything inside this hook that fires capability
+    // filters (user_has_cap etc.) can make another plugin call
+    // wp_get_current_user(), which re-enters determine_current_user before
+    // the user is resolved - infinite recursion and a blank 500 on every
+    // authenticated REST request (seen live with WooCommerce installed).
+    static $running = false;
+    if ($running || !empty($user_id) || !apw_is_secure_rest()) {
         return $user_id;
     }
     list($login, $pass) = apw_basic_creds();
     if ($login === null || $pass === null || $pass === '') {
         return $user_id;
     }
+    $running = true;
     $pass = str_replace(' ', '', $pass);
 
     $user = get_user_by('login', $login);
-    if (!$user || !user_can($user, 'edit_posts')) {
+    // Capability gate reads role caps off the user object directly. It MUST
+    // NOT go through user_can()/has_cap(): those apply user_has_cap filters,
+    // which is the recursion described above. Route permission_callbacks
+    // enforce real capabilities anyway - this is only a coarse gate.
+    if (!$user || empty($user->allcaps['edit_posts'])) {
+        $running = false;
         return $user_id;
     }
     $tokens = apw_get_tokens($user->ID);
     if (!$tokens) {
+        $running = false;
         return $user_id;
     }
     foreach ($tokens as &$tok) {
-        if (empty($tok['hash'])) {
+        if (!is_array($tok) || empty($tok['hash'])) {
             continue;
         }
         if (wp_check_password($pass, $tok['hash'], $user->ID)) {
             $tok['last_used'] = time();
             apw_save_tokens($user->ID, $tokens);
             $GLOBALS['apw_authed'] = true;
+            $running = false;
             return (int) $user->ID;
         }
     }
     unset($tok);
+    $running = false;
     return $user_id;
 }, 20);
 
